@@ -12,6 +12,7 @@ import (
 	"github.com/google/go-github/github"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"io/ioutil"
 	"os"
 	"regexp"
 	"time"
@@ -31,16 +32,6 @@ var client *github.Client
 var log *zap.SugaredLogger
 var pem *rsa.PrivateKey
 var courtCommentRegex *regexp.Regexp
-
-func init() {
-	pemBytes := []byte(os.Getenv("PEM"))
-	var err error
-	pem, err = jwt.ParseRSAPrivateKeyFromPEM(pemBytes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid PEM content- unable to parse %w", err)
-		os.Exit(1)
-	}
-}
 
 type TokenSource struct {
 }
@@ -65,17 +56,43 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Unable to initialize logger- %w", err)
 		os.Exit(1)
 	}
+	log = z.Sugar()
+
 	courtCommentRegex, err = regexp.Compile("<!-- ([\\w_]+) -->")
 	if err != nil {
 		log.Fatalf("Can't compile the regex! 🤷🏽‍♂️%w", err)
 	}
-	log = z.Sugar()
+
+	loadPemBytes()
 
 	// set up the github client with auth
 	httpClient := oauth2.NewClient(context.Background(), TokenSource{})
 	client = github.NewClient(httpClient)
 
 	lambda.Start(handleEvent)
+}
+
+func loadPemBytes() {
+	var pemBytes []byte
+	if pem := os.Getenv("PEM"); pem != "" {
+		pemBytes = []byte(pem)
+	} else if pemfile := os.Getenv("PEMFILE"); pemfile != "" {
+		file, err := os.Open(pemfile)
+		if err != nil {
+			log.Fatalf("Unable to find pemfile at %s: %w", pemfile, err)
+		}
+		pemBytes, err = ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("Unable to read pem bytes from file %s- %w", pemfile, err)
+		}
+	}
+	var err error
+	pem, err = jwt.ParseRSAPrivateKeyFromPEM(pemBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid PEM content- unable to parse %w", err)
+		os.Exit(1)
+	}
+	log.Info("Initialized private key")
 }
 
 func handleEvent(ctx context.Context, r events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
