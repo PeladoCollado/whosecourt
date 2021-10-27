@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 	"os"
+	"regexp"
 	"time"
 )
 
@@ -27,10 +28,9 @@ var courtLabels = make(map[string]*github.Label)
 var labelIds = make(map[int64]bool)
 
 var client *github.Client
-
 var log *zap.SugaredLogger
-
 var pem *rsa.PrivateKey
+var courtCommentRegex *regexp.Regexp
 
 func init() {
 	pemBytes := []byte(os.Getenv("PEM"))
@@ -64,6 +64,10 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to initialize logger- %w", err)
 		os.Exit(1)
+	}
+	courtCommentRegex, err = regexp.Compile("<!-- ([\\w_]+) -->")
+	if err != nil {
+		log.Fatalf("Can't compile the regex! 🤷🏽‍♂️%w", err)
 	}
 	log = z.Sugar()
 
@@ -121,7 +125,17 @@ func handleEvent(ctx context.Context, r events.APIGatewayProxyRequest) (events.A
 			}
 			err = changeCourt(ctx, REVIEWER_COURT, event.PullRequest)
 		case "pull_request_review_comment":
+			event := &github.PullRequestReviewCommentEvent{}
+			loadLabels(context.Background(), *event.Repo.Owner.Name, *event.Repo.Owner.Name)
+			decoder.Decode(event)
 
+			// support label updates in comments, such as <!-- reviewers_court --> or <!-- authors_court -->
+			if courtCommentRegex.Match([]byte(*event.Comment.Body)) {
+				labels := courtCommentRegex.FindStringSubmatch(*event.Comment.Body)
+				if len(labels) > 1 {
+					err = changeCourt(ctx, labels[1], event.PullRequest)
+				}
+			}
 		}
 	}
 	if err != nil {
