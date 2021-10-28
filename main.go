@@ -194,20 +194,21 @@ func getRepoOwner(repo *github.Repository) (string, string, error) {
 
 func changeCourt(ctx context.Context, court string, pr *github.PullRequest, client *github.Client) error {
 	log.Infof("Changing %d's court to %s", pr.ID, court)
-	newLabels := make([]*github.Label, 0, len(pr.Labels))
-	for _, l := range pr.Labels {
-		if _, ok := labelIds[*l.ID]; ok {
-			if *l.Name == court {
-				log.Infof("Review %d already has target label %s", pr.ID, court)
-				return nil
-			} else {
-				newLabels = append(newLabels, courtLabels[court])
-			}
-		} else {
-			newLabels = append(newLabels, l)
-		}
+	var oldCourt string
+	if court == REVIEWER_COURT {
+		oldCourt = AUTHOR_COURT
+	} else {
+		oldCourt = REVIEWER_COURT
 	}
-	pr.Labels = newLabels
-	_, _, err := client.PullRequests.Edit(ctx, *pr.GetBase().Repo.Owner.Name, *pr.GetBase().Repo.Name, *pr.Number, pr)
+
+	owner, repoName, err := getRepoOwner(pr.GetBase().Repo)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Issues.RemoveLabelForIssue(ctx, owner, repoName, *pr.Number, oldCourt)
+	if err != nil && (resp == nil || resp.StatusCode != 404) {
+		return err
+	}
+	_, _, err = client.Issues.AddLabelsToIssue(ctx, owner, repoName, *pr.Number, []string{court})
 	return err
 }
