@@ -1,115 +1,83 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/dgrijalva/jwt-go"
 	"github.com/google/go-github/github"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/oauth2"
-	"io/ioutil"
 	"os"
 	"regexp"
-	"time"
+	"strings"
 )
 
-const APP_ID = "myAppId"
+const APP_ID = 147975
 
 const REVIEWER_COURT = "reviewers_court"
 const AUTHOR_COURT = "authors_court"
 
-var ReviewerLabels = []string{REVIEWER_COURT, AUTHOR_COURT}
+var ReviewerLabels = map[string]bool{REVIEWER_COURT: true, AUTHOR_COURT: true}
 
 var courtLabels = make(map[string]*github.Label)
 var labelIds = make(map[int64]bool)
 
-var client *github.Client
 var log *zap.SugaredLogger
 var pem *rsa.PrivateKey
 var courtCommentRegex *regexp.Regexp
 
-type TokenSource struct {
-}
-
-func (t TokenSource) Token() (*oauth2.Token, error) {
-	claim := jwt.StandardClaims{
-		Issuer:    APP_ID,
-		IssuedAt:  time.Now().Unix(),
-		ExpiresAt: time.Now().Add(time.Minute).Unix(),
-	}
-	token := jwt.NewWithClaims(jwt.GetSigningMethod("RS256"), claim)
-	signedJwt, err := token.SignedString(pem)
-
-	return &oauth2.Token{
-		AccessToken: signedJwt,
-	}, err
-}
-
-func main() {
+func init() {
 	z, err := zap.NewProduction()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to initialize logger- %w", err)
+		fmt.Fprintf(os.Stderr, "Unable to initialize logger- %v", err)
 		os.Exit(1)
 	}
 	log = z.Sugar()
 
 	courtCommentRegex, err = regexp.Compile("<!-- ([\\w_]+) -->")
 	if err != nil {
-		log.Fatalf("Can't compile the regex! 🤷🏽‍♂️%w", err)
+		log.Fatalf("Can't compile the regex! 🤷🏽‍♂️%v", err)
 	}
 
 	loadPemBytes()
 
-	// set up the github client with auth
-	httpClient := oauth2.NewClient(context.Background(), TokenSource{})
-	client = github.NewClient(httpClient)
+}
 
+func main() {
 	lambda.Start(handleEvent)
 }
 
-func loadPemBytes() {
-	var pemBytes []byte
-	if pem := os.Getenv("PEM"); pem != "" {
-		pemBytes = []byte(pem)
-	} else if pemfile := os.Getenv("PEMFILE"); pemfile != "" {
-		file, err := os.Open(pemfile)
-		if err != nil {
-			log.Fatalf("Unable to find pemfile at %s: %w", pemfile, err)
-		}
-		pemBytes, err = ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("Unable to read pem bytes from file %s- %w", pemfile, err)
-		}
-	}
-	var err error
-	pem, err = jwt.ParseRSAPrivateKeyFromPEM(pemBytes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid PEM content- unable to parse %w", err)
-		os.Exit(1)
-	}
-	log.Info("Initialized private key")
-}
-
 func handleEvent(ctx context.Context, r events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	decoder := json.NewDecoder(bytes.NewBufferString(r.Body))
 	log.Debugf("Received new %s event- %v", r.HTTPMethod, r.Headers)
 	var err error
+	var client *github.Client
 	if r.HTTPMethod == "POST" {
-		switch githubEvent := r.Headers["X-GitHub-Event"]; githubEvent {
+		switch githubEvent := r.Headers["x-github-event"]; githubEvent {
 		case "pull_request":
 			event := &github.PullRequestEvent{}
 
-			loadLabels(context.Background(), *event.Repo.Owner.Name, *event.Repo.Owner.Name)
-			decoder.Decode(event)
+			err = json.Unmarshal([]byte(r.Body), event)
+			if err != nil {
+				log.Error("Unable to parse json - %v", err)
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Invalid JSON received")
+			}
+
+			client, err = initClientForInstallation(ctx, event.Installation.ID)
+			if err != nil {
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Unable to connect to github")
+			}
+			err = loadLabels(context.Background(), event.Repo, client)
+			if err != nil {
+				log.Error("Unable to load labels for repository- %v", err)
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Unable to load labels for repository")
+			}
 			action := *event.Action
 			if action == "review_requested" || action == "opened" || action == "reopened" {
 				if event.RequestedReviewer != nil || len(event.PullRequest.RequestedReviewers) > 0 {
-					err = changeCourt(ctx, REVIEWER_COURT, event.PullRequest)
+					err = changeCourt(ctx, REVIEWER_COURT, event.PullRequest, client)
 				}
 			} else if action == "unlabeled" {
 				courtLabelPresent := false
@@ -132,53 +100,99 @@ func handleEvent(ctx context.Context, r events.APIGatewayProxyRequest) (events.A
 				} else {
 					court = AUTHOR_COURT
 				}
-				err = changeCourt(ctx, court, event.PullRequest)
+				err = changeCourt(ctx, court, event.PullRequest, client)
 			}
 		case "pull_request_review":
 			event := &github.PullRequestReviewEvent{}
-			err = decoder.Decode(event)
+			err = json.Unmarshal([]byte(r.Body), event)
 			if err != nil {
-				return events.APIGatewayProxyResponse{StatusCode: 400, Body: fmt.Sprintf("Unable to decode JSON - %w", err)}, nil
+				return events.APIGatewayProxyResponse{StatusCode: 400, Body: fmt.Sprintf("Unable to decode JSON - %v", err)}, nil
 			}
-			err = changeCourt(ctx, REVIEWER_COURT, event.PullRequest)
+			client, err := initClientForInstallation(ctx, event.Installation.ID)
+			if err != nil {
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Unable to connect to github")
+			}
+			err = changeCourt(ctx, REVIEWER_COURT, event.PullRequest, client)
 		case "pull_request_review_comment":
 			event := &github.PullRequestReviewCommentEvent{}
-			loadLabels(context.Background(), *event.Repo.Owner.Name, *event.Repo.Owner.Name)
-			decoder.Decode(event)
+			err = json.Unmarshal([]byte(r.Body), event)
+			if err != nil {
+				log.Error("Unable to parse json - %v", err)
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Invalid JSON received")
+			}
+
+			client, err := initClientForInstallation(ctx, event.Installation.ID)
+			if err != nil {
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Unable to connect to github")
+			}
+			err = loadLabels(context.Background(), event.Repo, client)
+			if err != nil {
+				log.Error("Unable to load labels for repository- %v", err)
+				return events.APIGatewayProxyResponse{}, errors.Wrap(err, "Unable to load labels for repository")
+			}
 
 			// support label updates in comments, such as <!-- reviewers_court --> or <!-- authors_court -->
 			if courtCommentRegex.Match([]byte(*event.Comment.Body)) {
 				labels := courtCommentRegex.FindStringSubmatch(*event.Comment.Body)
 				if len(labels) > 1 {
-					err = changeCourt(ctx, labels[1], event.PullRequest)
+					err = changeCourt(ctx, labels[1], event.PullRequest, client)
 				}
 			}
 		}
 	}
 	if err != nil {
-		log.Errorf("Error handling request %w", err)
+		log.Errorf("Error handling request %v", err)
 		return events.APIGatewayProxyResponse{StatusCode: 500, Body: err.Error(), IsBase64Encoded: false}, err
 	} else {
 		return events.APIGatewayProxyResponse{StatusCode: 200}, nil
 	}
 }
 
-func loadLabels(ctx context.Context, owner string, repo string) error {
+func loadLabels(ctx context.Context, repo *github.Repository, client *github.Client) error {
 	if len(labelIds) == len(ReviewerLabels) {
 		return nil
 	}
-	for _, l := range ReviewerLabels {
-		label, _, err := client.Issues.GetLabel(ctx, owner, repo, l)
-		if err != nil {
+	owner, repoName, err2 := getRepoOwner(repo)
+	if err2 != nil {
+		return err2
+	}
+	for l, _ := range ReviewerLabels {
+		label, resp, err := client.Issues.GetLabel(ctx, owner, repoName, l)
+
+		// if label doesn't exist, create it
+		if resp != nil && resp.StatusCode == 404 {
+			log.Infof("Unable to find label %s. Attempting to create it", l)
+			label, resp, err = client.Issues.CreateLabel(ctx, owner, repoName, &github.Label{Name: &l})
+			if err != nil {
+				return errors.Wrap(err, fmt.Sprintf("Unable to create label %s", l))
+			}
+		} else if err != nil {
 			return err
 		}
 		labelIds[*label.ID] = true
 		courtLabels[*label.Name] = label
 	}
+	log.Info("Found labels %v", courtLabels)
 	return nil
 }
 
-func changeCourt(ctx context.Context, court string, pr *github.PullRequest) error {
+func getRepoOwner(repo *github.Repository) (string, string, error) {
+	var owner string
+	var repoName string
+	if repo.Owner.Name != nil {
+		owner = *repo.Owner.Name
+		repoName = *repo.Name
+	} else if strings.Count(*repo.FullName, "/") == 1 {
+		parts := strings.Split(*repo.FullName, "/")
+		owner = parts[0]
+		repoName = parts[1]
+	} else {
+		return "", "", fmt.Errorf("can't determine repository information from event %v", *repo)
+	}
+	return owner, repoName, nil
+}
+
+func changeCourt(ctx context.Context, court string, pr *github.PullRequest, client *github.Client) error {
 	log.Infof("Changing %d's court to %s", pr.ID, court)
 	newLabels := make([]*github.Label, 0, len(pr.Labels))
 	for _, l := range pr.Labels {
